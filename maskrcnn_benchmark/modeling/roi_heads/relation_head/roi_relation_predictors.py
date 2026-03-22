@@ -128,6 +128,26 @@ class PrototypeEmbeddingNetwork(nn.Module):
         
         self.nms_thresh = self.cfg.TEST.RELATION.LATER_NMS_PREDICTION_THRES
 
+        ##### Neural Collapse ETF Regularization (Papyan et al., PNAS 2020; Yang et al., NeurIPS 2022) #####
+        # Generate fixed Simplex ETF for 51 classes in 4096d space
+        # Pairwise cosine similarity = -1/(K-1) = -1/50 = -0.02
+        etf_dim = self.mlp_dim * 2  # 4096
+        etf_protos = self._generate_simplex_etf(self.num_rel_cls, etf_dim)
+        self.register_buffer('etf_protos', etf_protos)  # [51, 4096], frozen
+        self.etf_lambda = 0.1  # regularization weight
+        ##### End ETF init #####
+
+    def _generate_simplex_etf(self, num_classes, dim):
+        """Generate Simplex ETF: K unit vectors in d-dim with pairwise cosine = -1/(K-1)."""
+        torch.manual_seed(42)  # fixed seed for reproducibility
+        rand_mat = torch.randn(dim, num_classes)
+        Q, _ = torch.linalg.qr(rand_mat)
+        U = Q[:, :num_classes]  # [dim, K]
+        I_K = torch.eye(num_classes)
+        ones_mat = torch.ones(num_classes, num_classes) / num_classes
+        etf = (num_classes / (num_classes - 1.0)) ** 0.5 * U @ (I_K - ones_mat)
+        return F.normalize(etf.T, dim=1)  # [K, dim], unit norm
+
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None):
 
@@ -241,6 +261,20 @@ class PrototypeEmbeddingNetwork(nn.Module):
             loss_sum = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1).mean()
             add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1)
             ### end 
+
+            ##### Neural Collapse ETF Regularization Loss #####
+            # Push prototypes toward Simplex ETF geometry for maximal equiangular separation
+            proto_norm = predicate_proto_norm  # already L2-normalized [51, 4096]
+            # Cosine similarity between each prototype and each ETF vertex
+            sim_to_etf = proto_norm @ self.etf_protos.t()  # [51, 51]
+            # Greedy assignment: each prototype matches its closest ETF vertex
+            _, etf_assignment = sim_to_etf.max(dim=1)  # [51]
+            etf_targets = self.etf_protos[etf_assignment]  # [51, 4096]
+            # Loss: 1 - mean cosine similarity to assigned ETF vertices
+            etf_cos = (proto_norm * etf_targets).sum(dim=1)  # [51]
+            etf_loss = 1.0 - etf_cos.mean()
+            add_losses.update({"etf_loss": self.etf_lambda * etf_loss})
+            ##### End ETF loss #####
  
         return entity_dists, rel_dists, add_losses, add_data
 
