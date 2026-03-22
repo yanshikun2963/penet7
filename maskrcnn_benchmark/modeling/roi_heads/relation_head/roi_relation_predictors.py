@@ -134,7 +134,7 @@ class PrototypeEmbeddingNetwork(nn.Module):
         etf_dim = self.mlp_dim * 2  # 4096
         etf_protos = self._generate_simplex_etf(self.num_rel_cls, etf_dim)
         self.register_buffer('etf_protos', etf_protos)  # [51, 4096], frozen
-        self.etf_lambda = 0.1  # regularization weight
+        self.etf_lambda = config.MODEL.ROI_RELATION_HEAD.ETF_LAMBDA  # configurable: default 0.1
         ##### End ETF init #####
 
     def _generate_simplex_etf(self, num_classes, dim):

@@ -599,3 +599,30 @@ _C.DTYPE = "float32"
 
 # Enable verbosity in apex.amp
 _C.AMP_VERBOSE = False
+
+# ---------------------------------------------------------------------------- #
+# Novel Module Hyperparameters (for ICANN 2026 experiments)
+# ---------------------------------------------------------------------------- #
+# LDAM Angular Margins (penet5)
+_C.MODEL.ROI_RELATION_HEAD.LDAM_MARGIN_C = 0.5       # margin scale constant
+_C.MODEL.ROI_RELATION_HEAD.LDAM_MARGIN_EXP = 0.25    # margin exponent (1/4)
+_C.MODEL.ROI_RELATION_HEAD.LDAM_WARMUP_ITER = 2000    # iters before margin kicks in
+_C.MODEL.ROI_RELATION_HEAD.LDAM_ANNEAL_ITER = 10000   # iters for full margin
+
+# Per-class vMF Concentration (penet6)
+_C.MODEL.ROI_RELATION_HEAD.VMF_KAPPA_LR_MULT = 1.0   # learning rate multiplier for kappa
+_C.MODEL.ROI_RELATION_HEAD.VMF_KAPPA_CLAMP_MAX = 100.0  # max kappa value
+
+# Neural Collapse ETF (penet7)
+_C.MODEL.ROI_RELATION_HEAD.ETF_LAMBDA = 0.1           # ETF regularization weight
+
+# Prototype GNN (penet8)
+_C.MODEL.ROI_RELATION_HEAD.GNN_LAYERS = 2             # number of GCN layers
+_C.MODEL.ROI_RELATION_HEAD.GNN_HIDDEN = 512           # GCN hidden dim
+_C.MODEL.ROI_RELATION_HEAD.GNN_ADJ_THRESH = 0.5       # adjacency threshold
+
+# VIB Information Bottleneck (penet9)
+_C.MODEL.ROI_RELATION_HEAD.VIB_BOTTLENECK = 1024      # bottleneck dimension
+_C.MODEL.ROI_RELATION_HEAD.VIB_BETA_TARGET = 0.0001   # target beta
+_C.MODEL.ROI_RELATION_HEAD.VIB_BYPASS_ITER = 3000     # iters before KL kicks in
+_C.MODEL.ROI_RELATION_HEAD.VIB_ANNEAL_END = 20000     # iters for full beta
