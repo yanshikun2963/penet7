@@ -139,8 +139,10 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
     def _generate_simplex_etf(self, num_classes, dim):
         """Generate Simplex ETF: K unit vectors in d-dim with pairwise cosine = -1/(K-1)."""
-        torch.manual_seed(42)  # fixed seed for reproducibility
-        rand_mat = torch.randn(dim, num_classes)
+        # Use local generator to avoid polluting global random state
+        gen = torch.Generator()
+        gen.manual_seed(42)
+        rand_mat = torch.randn(dim, num_classes, generator=gen)
         Q, _ = torch.linalg.qr(rand_mat)
         U = Q[:, :num_classes]  # [dim, K]
         I_K = torch.eye(num_classes)
