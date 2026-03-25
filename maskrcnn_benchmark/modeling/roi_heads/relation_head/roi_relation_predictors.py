@@ -104,6 +104,10 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
+        # EMA prototype smoothing: temporally-smoothed prototypes for stable learning
+        self.ema_proto_momentum = 0.999
+        self.ema_consistency_weight = 0.5  # weight for prototype consistency loss
+
         ##### refine object labels
         self.pos_embed = nn.Sequential(*[
             nn.Linear(9, 32), nn.BatchNorm1d(32, momentum= 0.001),
@@ -127,6 +131,10 @@ class PrototypeEmbeddingNetwork(nn.Module):
             self.mode = 'sgdet'
         
         self.nms_thresh = self.cfg.TEST.RELATION.LATER_NMS_PREDICTION_THRES
+
+        # EMA prototype buffer (initialized on first forward)
+        self.register_buffer('ema_proto_buf', None)
+        self.ema_proto_initialized = False
 
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None):
@@ -241,6 +249,19 @@ class PrototypeEmbeddingNetwork(nn.Module):
             loss_sum = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1).mean()
             add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1)
             ### end 
+
+            ### EMA Prototype Smoothing: temporal consistency regularization
+            with torch.no_grad():
+                if not self.ema_proto_initialized:
+                    self.ema_proto_buf = predicate_proto.clone().detach()
+                    self.ema_proto_initialized = True
+                else:
+                    self.ema_proto_buf = self.ema_proto_momentum * self.ema_proto_buf + \
+                                        (1 - self.ema_proto_momentum) * predicate_proto.detach()
+            # Consistency loss: pull current prototypes towards their EMA (prevents oscillation)
+            ema_consistency = F.mse_loss(predicate_proto, self.ema_proto_buf.detach())
+            add_losses.update({"ema_consistency": ema_consistency * self.ema_consistency_weight})
+            ### end EMA
  
         return entity_dists, rel_dists, add_losses, add_data
 
