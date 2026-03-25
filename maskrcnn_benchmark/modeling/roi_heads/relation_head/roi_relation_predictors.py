@@ -104,9 +104,12 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        # EMA prototype smoothing: temporally-smoothed prototypes for stable learning
+        ##### EMA Prototype Smoothing
         self.ema_proto_momentum = 0.999
-        self.ema_consistency_weight = 0.5  # weight for prototype consistency loss
+        self.register_buffer('ema_proto_smooth', None)
+        self.register_buffer('ema_proto_init', torch.tensor(0))
+        self.ema_consistency_weight = 0.5  # weight for consistency loss
+        #####
 
         ##### refine object labels
         self.pos_embed = nn.Sequential(*[
@@ -131,10 +134,6 @@ class PrototypeEmbeddingNetwork(nn.Module):
             self.mode = 'sgdet'
         
         self.nms_thresh = self.cfg.TEST.RELATION.LATER_NMS_PREDICTION_THRES
-
-        # EMA prototype buffer (initialized on first forward)
-        self.register_buffer('ema_proto_buf', None)
-        self.ema_proto_initialized = False
 
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None):
@@ -204,17 +203,39 @@ class PrototypeEmbeddingNetwork(nn.Module):
         predicate_proto = self.project_head(self.dropout_pred(torch.relu(predicate_proto)))
         ######
 
+        ##### EMA Prototype Smoothing: use temporally-smoothed prototypes for classification
+        if self.training:
+            if self.ema_proto_init == 0:
+                self.ema_proto_smooth = predicate_proto.clone().detach()
+                self.ema_proto_init.fill_(1)
+            else:
+                with torch.no_grad():
+                    self.ema_proto_smooth = self.ema_proto_momentum * self.ema_proto_smooth + (1 - self.ema_proto_momentum) * predicate_proto.detach()
+            # Use EMA prototypes for classification (more stable targets)
+            proto_for_cls = self.ema_proto_smooth.detach()
+        else:
+            proto_for_cls = predicate_proto
+        #####
+
         rel_rep_norm = rel_rep / rel_rep.norm(dim=1, keepdim=True)  # r_norm
         predicate_proto_norm = predicate_proto / predicate_proto.norm(dim=1, keepdim=True)  # c_norm
+        proto_for_cls_norm = proto_for_cls / (proto_for_cls.norm(dim=1, keepdim=True) + 1e-8)
 
         ### (Prototype-based Learning  ---- cosine similarity) & (Relation Prediction)
-        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()  #  <r_norm, c_norm> / τ
+        rel_dists = rel_rep_norm @ proto_for_cls_norm.t() * self.logit_scale.exp()  #  <r_norm, c_norm_ema> / τ
         # the rel_dists will be used to calculate the Le_sim with the ce_loss
 
         entity_dists = entity_dists.split(num_objs, dim=0)
         rel_dists = rel_dists.split(num_rels, dim=0)
 
         if self.training:
+
+            ### EMA Prototype Consistency Loss
+            # Encourage current prototypes to stay close to their EMA versions
+            if self.ema_proto_init == 1:
+                consistency_loss = F.mse_loss(predicate_proto_norm, proto_for_cls_norm.detach())
+                add_losses.update({"ema_consistency_loss": self.ema_consistency_weight * consistency_loss})
+            ### end
 
             ### Prototype Regularization  ---- cosine similarity
             target_rpredicate_proto_norm = predicate_proto_norm.clone().detach() 
@@ -249,19 +270,6 @@ class PrototypeEmbeddingNetwork(nn.Module):
             loss_sum = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1).mean()
             add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1)
             ### end 
-
-            ### EMA Prototype Smoothing: temporal consistency regularization
-            with torch.no_grad():
-                if not self.ema_proto_initialized:
-                    self.ema_proto_buf = predicate_proto.clone().detach()
-                    self.ema_proto_initialized = True
-                else:
-                    self.ema_proto_buf = self.ema_proto_momentum * self.ema_proto_buf + \
-                                        (1 - self.ema_proto_momentum) * predicate_proto.detach()
-            # Consistency loss: pull current prototypes towards their EMA (prevents oscillation)
-            ema_consistency = F.mse_loss(predicate_proto, self.ema_proto_buf.detach())
-            add_losses.update({"ema_consistency": ema_consistency * self.ema_consistency_weight})
-            ### end EMA
  
         return entity_dists, rel_dists, add_losses, add_data
 
