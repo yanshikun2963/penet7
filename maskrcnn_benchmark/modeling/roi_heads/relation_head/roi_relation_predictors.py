@@ -104,14 +104,19 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        ##### Component 2: GloVe-guided Adaptive Prototype Separation (GAPS)
-        glove_norm = rel_embed_vecs / (rel_embed_vecs.norm(dim=1, keepdim=True) + 1e-8)
-        glove_sim = glove_norm @ glove_norm.t()
-        gaps_gamma_base = 5.0
-        gaps_alpha = 0.5
-        adaptive_margin = gaps_gamma_base * (1.0 + gaps_alpha * glove_sim.clamp(min=0))
-        self.register_buffer('gaps_adaptive_margin', adaptive_margin)
-        self.gaps_topk = 5
+        ##### Component 2: Semantic Confusion-Aware Prototype Margin
+        # GloVe-based semantic similarity drives adaptive margins between prototypes
+        # Similar predicates (on/above, in/inside) get larger separating margins
+        rel_embed_vecs_for_sim = rel_vectors(rel_classes, wv_dir=config.GLOVE_DIR, wv_dim=self.embed_dim)
+        rel_embed_norm = rel_embed_vecs_for_sim / (rel_embed_vecs_for_sim.norm(dim=1, keepdim=True) + 1e-8)
+        glove_sim = rel_embed_norm @ rel_embed_norm.t()  # (51, 51) cosine similarity
+        # Adaptive gamma: higher for semantically similar pairs
+        gamma_base = 7.0
+        gamma_max = 12.0
+        adaptive_gamma = gamma_base + (gamma_max - gamma_base) * torch.relu(glove_sim)
+        self.register_buffer('adaptive_gamma', adaptive_gamma)
+        # Also add a learnable CosFace-style margin for GT class
+        self.cosface_margin = 0.15
         #####
 
         ##### refine object labels
@@ -210,7 +215,9 @@ class PrototypeEmbeddingNetwork(nn.Module):
         predicate_proto_norm = predicate_proto / predicate_proto.norm(dim=1, keepdim=True)  # c_norm
 
         ### (Prototype-based Learning  ---- cosine similarity) & (Relation Prediction)
-        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()  #  <r_norm, c_norm> / τ
+        ### Component 2: CosFace margin on GT class during training
+        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()
+        ###
         # the rel_dists will be used to calculate the Le_sim with the ce_loss
 
         entity_dists = entity_dists.split(num_objs, dim=0)
@@ -253,14 +260,32 @@ class PrototypeEmbeddingNetwork(nn.Module):
             ### end 
 
  
-            # GAPS: Adaptive prototype separation loss
-            proto_dis = proto_dis_mat  # reuse from dist_loss2
-            _, topk_idx = torch.topk(self.gaps_adaptive_margin, self.gaps_topk + 1, dim=1)
-            topk_idx = topk_idx[:, 1:]  # exclude self
-            topk_dist = torch.gather(proto_dis, 1, topk_idx)
-            topk_margin = torch.gather(self.gaps_adaptive_margin, 1, topk_idx)
-            gaps_loss = torch.relu(topk_margin - topk_dist).mean() * 0.5
-            add_losses.update({"gaps_loss": gaps_loss})
+
+            ### Component 2: Semantic Confusion-Aware Margin
+            # 1. CosFace margin: subtract margin from GT class logit during training
+            if self.training:
+                # Re-compute rel_dists with margin (for the CE loss, not the returned dists)
+                margin_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()
+                margin_dists[torch.arange(rel_labels.size(0)), rel_labels] -= self.cosface_margin * self.logit_scale.exp()
+                # Update the rel_dists for loss computation
+                # We need to update the split rel_dists - reconstruct
+                rel_dists = margin_dists.split(num_rels, dim=0)
+            
+            # 2. Adaptive prototype separation with GloVe-guided margins
+            # Replace fixed gamma2 with adaptive per-pair gamma
+            predicate_proto_a2 = predicate_proto.unsqueeze(dim=1).expand(-1, 51, -1)
+            predicate_proto_b2 = predicate_proto.detach().unsqueeze(dim=0).expand(51, -1, -1)
+            proto_dis_mat2 = (predicate_proto_a2 - predicate_proto_b2).norm(dim=2) ** 2
+            # Per-pair margin loss using adaptive gamma
+            margin_violation = torch.relu(-proto_dis_mat2 + self.adaptive_gamma)
+            # Mask diagonal (self-distance = 0)
+            mask_diag = 1.0 - torch.eye(51, device=proto_dis_mat2.device)
+            semantic_margin_loss = (margin_violation * mask_diag).sum() / (51 * 50)
+            add_losses.update({"semantic_margin_loss": semantic_margin_loss * 0.1})
+            # Override the fixed dist_loss2 with our adaptive version
+            add_losses["dist_loss2"] = semantic_margin_loss * 0.1
+            ###
+
  
         return entity_dists, rel_dists, add_losses, add_data
 
