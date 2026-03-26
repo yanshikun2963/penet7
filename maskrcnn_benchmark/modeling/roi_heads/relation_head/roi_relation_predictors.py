@@ -102,14 +102,22 @@ class PrototypeEmbeddingNetwork(nn.Module):
        
         self.down_samp = MLP(self.pooling_dim, self.mlp_dim, self.mlp_dim, 2) 
 
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        # Per-class temperature: each predicate gets its own temperature
+        self.per_class_logit_scale = nn.Parameter(torch.ones(self.num_rel_cls) * np.log(1 / 0.07))
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))  # keep for compatibility
 
-        ##### EMA Prototype Smoothing
-        self.ema_proto_momentum = 0.999
-        self.register_buffer('ema_proto_smooth', None)
-        self.register_buffer('ema_proto_init', torch.tensor(0))
-        self.ema_consistency_weight = 0.5  # weight for consistency loss
+        ##### SAPS: Semantic-Aware Prototype Separation
+        rel_embed_vecs_local = rel_vectors(rel_classes, wv_dir=config.GLOVE_DIR, wv_dim=self.embed_dim)
+        with torch.no_grad():
+            glove_norms = rel_embed_vecs_local / (rel_embed_vecs_local.norm(dim=1, keepdim=True) + 1e-8)
+            glove_sim = glove_norms @ glove_norms.t()
+            glove_sim.fill_diagonal_(0.0)
+            glove_sim = torch.clamp(glove_sim, min=0.0)
+        self.register_buffer('glove_sim_matrix', glove_sim)
+        self.saps_lambda = 1.0
+        self.saps_margin = 12.0
         #####
+
 
         ##### refine object labels
         self.pos_embed = nn.Sequential(*[
@@ -203,39 +211,19 @@ class PrototypeEmbeddingNetwork(nn.Module):
         predicate_proto = self.project_head(self.dropout_pred(torch.relu(predicate_proto)))
         ######
 
-        ##### EMA Prototype Smoothing: use temporally-smoothed prototypes for classification
-        if self.training:
-            if self.ema_proto_init == 0:
-                self.ema_proto_smooth = predicate_proto.clone().detach()
-                self.ema_proto_init.fill_(1)
-            else:
-                with torch.no_grad():
-                    self.ema_proto_smooth = self.ema_proto_momentum * self.ema_proto_smooth + (1 - self.ema_proto_momentum) * predicate_proto.detach()
-            # Use EMA prototypes for classification (more stable targets)
-            proto_for_cls = self.ema_proto_smooth.detach()
-        else:
-            proto_for_cls = predicate_proto
-        #####
-
         rel_rep_norm = rel_rep / rel_rep.norm(dim=1, keepdim=True)  # r_norm
         predicate_proto_norm = predicate_proto / predicate_proto.norm(dim=1, keepdim=True)  # c_norm
-        proto_for_cls_norm = proto_for_cls / (proto_for_cls.norm(dim=1, keepdim=True) + 1e-8)
 
         ### (Prototype-based Learning  ---- cosine similarity) & (Relation Prediction)
-        rel_dists = rel_rep_norm @ proto_for_cls_norm.t() * self.logit_scale.exp()  #  <r_norm, c_norm_ema> / τ
+        # Per-class temperature: each predicate class has its own scale
+        cosine_sim = rel_rep_norm @ predicate_proto_norm.t()  # (N, 51)
+        rel_dists = cosine_sim * self.per_class_logit_scale.exp().unsqueeze(0)  # per-class τ
         # the rel_dists will be used to calculate the Le_sim with the ce_loss
 
         entity_dists = entity_dists.split(num_objs, dim=0)
         rel_dists = rel_dists.split(num_rels, dim=0)
 
         if self.training:
-
-            ### EMA Prototype Consistency Loss
-            # Encourage current prototypes to stay close to their EMA versions
-            if self.ema_proto_init == 1:
-                consistency_loss = F.mse_loss(predicate_proto_norm, proto_for_cls_norm.detach())
-                add_losses.update({"ema_consistency_loss": self.ema_consistency_weight * consistency_loss})
-            ### end
 
             ### Prototype Regularization  ---- cosine similarity
             target_rpredicate_proto_norm = predicate_proto_norm.clone().detach() 
@@ -254,6 +242,13 @@ class PrototypeEmbeddingNetwork(nn.Module):
             dist_loss = torch.max(torch.zeros(51).cuda(), -topK_proto_dis + gamma2).mean()  # Lr_euc = max(0, -(d-) + gamma2)
             add_losses.update({"dist_loss2": dist_loss})
             ### end 
+
+            ### SAPS loss
+            weighted_margin = self.saps_margin * self.glove_sim_matrix
+            saps_violation = torch.clamp(weighted_margin - proto_dis_mat, min=0.0)
+            saps_loss = (saps_violation * self.glove_sim_matrix).sum() / (self.glove_sim_matrix.sum() + 1e-8)
+            add_losses.update({"saps_loss": self.saps_lambda * saps_loss})
+            ### end
 
             ###  Prototype-based Learning  ---- Euclidean distance
             rel_labels = cat(rel_labels, dim=0)
