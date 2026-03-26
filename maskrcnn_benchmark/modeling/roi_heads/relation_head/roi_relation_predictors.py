@@ -104,20 +104,7 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        ##### Component 2: Semantic Confusion-Aware Prototype Margin
-        # GloVe-based semantic similarity drives adaptive margins between prototypes
-        # Similar predicates (on/above, in/inside) get larger separating margins
-        rel_embed_vecs_for_sim = rel_vectors(rel_classes, wv_dir=config.GLOVE_DIR, wv_dim=self.embed_dim)
-        rel_embed_norm = rel_embed_vecs_for_sim / (rel_embed_vecs_for_sim.norm(dim=1, keepdim=True) + 1e-8)
-        glove_sim = rel_embed_norm @ rel_embed_norm.t()  # (51, 51) cosine similarity
-        # Adaptive gamma: higher for semantically similar pairs
-        gamma_base = 7.0
-        gamma_max = 12.0
-        adaptive_gamma = gamma_base + (gamma_max - gamma_base) * torch.relu(glove_sim)
-        self.register_buffer('adaptive_gamma', adaptive_gamma)
-        # Also add a learnable CosFace-style margin for GT class
-        self.cosface_margin = 0.15
-        #####
+
 
         ##### refine object labels
         self.pos_embed = nn.Sequential(*[
@@ -215,9 +202,7 @@ class PrototypeEmbeddingNetwork(nn.Module):
         predicate_proto_norm = predicate_proto / predicate_proto.norm(dim=1, keepdim=True)  # c_norm
 
         ### (Prototype-based Learning  ---- cosine similarity) & (Relation Prediction)
-        ### Component 2: CosFace margin on GT class during training
-        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()
-        ###
+        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()  #  <r_norm, c_norm> / τ
         # the rel_dists will be used to calculate the Le_sim with the ce_loss
 
         entity_dists = entity_dists.split(num_objs, dim=0)
@@ -258,33 +243,6 @@ class PrototypeEmbeddingNetwork(nn.Module):
             loss_sum = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1).mean()
             add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1)
             ### end 
-
- 
-
-            ### Component 2: Semantic Confusion-Aware Margin
-            # 1. CosFace margin: subtract margin from GT class logit during training
-            if self.training:
-                # Re-compute rel_dists with margin (for the CE loss, not the returned dists)
-                margin_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()
-                margin_dists[torch.arange(rel_labels.size(0)), rel_labels] -= self.cosface_margin * self.logit_scale.exp()
-                # Update the rel_dists for loss computation
-                # We need to update the split rel_dists - reconstruct
-                rel_dists = margin_dists.split(num_rels, dim=0)
-            
-            # 2. Adaptive prototype separation with GloVe-guided margins
-            # Replace fixed gamma2 with adaptive per-pair gamma
-            predicate_proto_a2 = predicate_proto.unsqueeze(dim=1).expand(-1, 51, -1)
-            predicate_proto_b2 = predicate_proto.detach().unsqueeze(dim=0).expand(51, -1, -1)
-            proto_dis_mat2 = (predicate_proto_a2 - predicate_proto_b2).norm(dim=2) ** 2
-            # Per-pair margin loss using adaptive gamma
-            margin_violation = torch.relu(-proto_dis_mat2 + self.adaptive_gamma)
-            # Mask diagonal (self-distance = 0)
-            mask_diag = 1.0 - torch.eye(51, device=proto_dis_mat2.device)
-            semantic_margin_loss = (margin_violation * mask_diag).sum() / (51 * 50)
-            add_losses.update({"semantic_margin_loss": semantic_margin_loss * 0.1})
-            # Override the fixed dist_loss2 with our adaptive version
-            add_losses["dist_loss2"] = semantic_margin_loss * 0.1
-            ###
 
  
         return entity_dists, rel_dists, add_losses, add_data
