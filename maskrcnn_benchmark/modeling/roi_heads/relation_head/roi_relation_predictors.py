@@ -102,22 +102,17 @@ class PrototypeEmbeddingNetwork(nn.Module):
        
         self.down_samp = MLP(self.pooling_dim, self.mlp_dim, self.mlp_dim, 2) 
 
-        # Per-class temperature: each predicate gets its own temperature
-        self.per_class_logit_scale = nn.Parameter(torch.ones(self.num_rel_cls) * np.log(1 / 0.07))
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))  # keep for compatibility
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        ##### SAPS: Semantic-Aware Prototype Separation
-        rel_embed_vecs_local = rel_vectors(rel_classes, wv_dir=config.GLOVE_DIR, wv_dim=self.embed_dim)
-        with torch.no_grad():
-            glove_norms = rel_embed_vecs_local / (rel_embed_vecs_local.norm(dim=1, keepdim=True) + 1e-8)
-            glove_sim = glove_norms @ glove_norms.t()
-            glove_sim.fill_diagonal_(0.0)
-            glove_sim = torch.clamp(glove_sim, min=0.0)
-        self.register_buffer('glove_sim_matrix', glove_sim)
-        self.saps_lambda = 1.0
-        self.saps_margin = 12.0
+        ##### Component 2: GloVe-guided Adaptive Prototype Separation (GAPS)
+        glove_norm = rel_embed_vecs / (rel_embed_vecs.norm(dim=1, keepdim=True) + 1e-8)
+        glove_sim = glove_norm @ glove_norm.t()
+        gaps_gamma_base = 5.0
+        gaps_alpha = 0.5
+        adaptive_margin = gaps_gamma_base * (1.0 + gaps_alpha * glove_sim.clamp(min=0))
+        self.register_buffer('gaps_adaptive_margin', adaptive_margin)
+        self.gaps_topk = 5
         #####
-
 
         ##### refine object labels
         self.pos_embed = nn.Sequential(*[
@@ -215,9 +210,7 @@ class PrototypeEmbeddingNetwork(nn.Module):
         predicate_proto_norm = predicate_proto / predicate_proto.norm(dim=1, keepdim=True)  # c_norm
 
         ### (Prototype-based Learning  ---- cosine similarity) & (Relation Prediction)
-        # Per-class temperature: each predicate class has its own scale
-        cosine_sim = rel_rep_norm @ predicate_proto_norm.t()  # (N, 51)
-        rel_dists = cosine_sim * self.per_class_logit_scale.exp().unsqueeze(0)  # per-class τ
+        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()  #  <r_norm, c_norm> / τ
         # the rel_dists will be used to calculate the Le_sim with the ce_loss
 
         entity_dists = entity_dists.split(num_objs, dim=0)
@@ -243,13 +236,6 @@ class PrototypeEmbeddingNetwork(nn.Module):
             add_losses.update({"dist_loss2": dist_loss})
             ### end 
 
-            ### SAPS loss
-            weighted_margin = self.saps_margin * self.glove_sim_matrix
-            saps_violation = torch.clamp(weighted_margin - proto_dis_mat, min=0.0)
-            saps_loss = (saps_violation * self.glove_sim_matrix).sum() / (self.glove_sim_matrix.sum() + 1e-8)
-            add_losses.update({"saps_loss": self.saps_lambda * saps_loss})
-            ### end
-
             ###  Prototype-based Learning  ---- Euclidean distance
             rel_labels = cat(rel_labels, dim=0)
             gamma1 = 1.0
@@ -265,6 +251,16 @@ class PrototypeEmbeddingNetwork(nn.Module):
             loss_sum = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1).mean()
             add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1)
             ### end 
+
+ 
+            # GAPS: Adaptive prototype separation loss
+            proto_dis = proto_dis_mat  # reuse from dist_loss2
+            _, topk_idx = torch.topk(self.gaps_adaptive_margin, self.gaps_topk + 1, dim=1)
+            topk_idx = topk_idx[:, 1:]  # exclude self
+            topk_dist = torch.gather(proto_dis, 1, topk_idx)
+            topk_margin = torch.gather(self.gaps_adaptive_margin, 1, topk_idx)
+            gaps_loss = torch.relu(topk_margin - topk_dist).mean() * 0.5
+            add_losses.update({"gaps_loss": gaps_loss})
  
         return entity_dists, rel_dists, add_losses, add_data
 
